@@ -51,7 +51,7 @@ jobs:
             if [ "$status" = "completed" ] && [ "$conclusion" != "success" ] && [ "$retried" -lt 3 ]; then
               retried=$((retried+1))
               echo "デプロイ失敗を検出 → 再実行 ($retried/3)"
-              gh run rerun "$run_id" || true
+              gh run rerun "$run_id" --repo "${{ github.repository }}" || true
             fi
           done
           echo "::warning::監視時間内にPagesデプロイが完了しませんでした"
