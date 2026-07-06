@@ -1,7 +1,13 @@
 # Pagesデプロイの見張り番: push後にビルド結果を確認し、
-# "Deployment failed, try again later"(GitHub側の一時不調)なら自動で再ビルドを要求する。
+# "Deployment failed, try again later"(GitHub側の一時不調)なら自動で再実行する。
 # 2026-07-02〜03にこの一時不調が断続発生し、ダッシュボードが数時間古いまま
 # 止まったことへの対策。公開リポジトリなのでActions分は消費しない。
+#
+# 2026-07-06修正: pages/builds/latest(legacy API)はActions経由デプロイの
+# 状態を反映しない(常にstatus=buildingのまま停滞し"errored"を検知できず、
+# 再ビルド要求が一度も発火していなかった)。実際の"pages build and
+# deployment"ワークフロー実行をhead_shaで特定し、そのconclusionを見て
+# 失敗時にgh run rerunする方式に変更。
 name: Pagesデプロイ検証
 
 on:
@@ -10,7 +16,7 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  pages: write
+  actions: write
   contents: read
 
 concurrency:
@@ -21,28 +27,34 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - name: ビルド完了を確認(失敗なら再要求・最大3回)
+      - name: デプロイ完了を確認(失敗なら再実行・最大3回)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           retried=0
           for i in $(seq 1 10); do
             sleep 45
-            info=$(gh api "repos/${{ github.repository }}/pages/builds/latest" \
-                     --jq '.status + " " + .commit' || echo "unknown unknown")
-            status=${info%% *}; sha=${info##* }
-            echo "[$i] pages build: status=$status commit=${sha:0:7} (期待 ${GITHUB_SHA:0:7})"
-            if [ "$sha" = "$GITHUB_SHA" ] && [ "$status" = "built" ]; then
-              echo "デプロイ反映を確認"
+            run_id=$(gh api "repos/${{ github.repository }}/actions/runs?head_sha=${GITHUB_SHA}&per_page=20" \
+                       --jq '[.workflow_runs[] | select(.name=="pages build and deployment")][0].id // empty')
+            if [ -z "$run_id" ]; then
+              echo "[$i] pages build and deployment run未検出 (commit ${GITHUB_SHA:0:7})"
+              continue
+            fi
+            info=$(gh api "repos/${{ github.repository }}/actions/runs/${run_id}" \
+                     --jq '.status + " " + (.conclusion // "null")')
+            status=${info%% *}; conclusion=${info##* }
+            echo "[$i] run=${run_id} status=$status conclusion=$conclusion"
+            if [ "$status" = "completed" ] && [ "$conclusion" = "success" ]; then
+              echo "デプロイ成功を確認"
               exit 0
             fi
-            if [ "$status" = "errored" ] && [ "$retried" -lt 3 ]; then
+            if [ "$status" = "completed" ] && [ "$conclusion" != "success" ] && [ "$retried" -lt 3 ]; then
               retried=$((retried+1))
-              echo "ビルド失敗を検出 → 再ビルド要求 ($retried/3)"
-              gh api -X POST "repos/${{ github.repository }}/pages/builds" || true
+              echo "デプロイ失敗を検出 → 再実行 ($retried/3)"
+              gh run rerun "$run_id" || true
             fi
           done
-          echo "::warning::監視時間内にPagesビルドが完了しませんでした"
+          echo "::warning::監視時間内にPagesデプロイが完了しませんでした"
           if [ -n "${{ vars.NTFY_TOPIC }}" ]; then
             curl -s -X POST "https://ntfy.sh/" -H "Content-Type: application/json" \
               -d "{\"topic\":\"${{ vars.NTFY_TOPIC }}\",\"title\":\"⚠ Market Compass 配信遅延\",\"message\":\"GitHub Pagesのデプロイが自動リトライ後も完了していません。次回更新で回復する見込みですが、続くようならActionsを確認してください。\",\"priority\":3}" || true
